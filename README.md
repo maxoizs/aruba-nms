@@ -7,6 +7,7 @@ A Python-based network management system for Aruba network devices.
 - Asynchronous polling of network devices
 - GUI interface with sortable columns
 - CSV export functionality
+- Ability to open custom IP files at runtime
 
 ## Installation
 
@@ -39,7 +40,10 @@ aruba-nms-gui
 
 ## Configuration
 
-Place your IP addresses in the `aruba_nms/data/ip.txt` file, one IP address per line.
+You can configure the IP addresses in two ways:
+
+1. Default IP file: Place your IP addresses in the `aruba_nms/data/ip.txt` file, one IP address per line.
+2. Custom IP file: Click the "Open IP File" button in the GUI to select any text file containing IP addresses (one per line).
 
 ## Dependencies
 

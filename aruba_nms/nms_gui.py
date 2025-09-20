@@ -30,10 +30,8 @@ urllib3.disable_warnings()
 # ---------------- Configuration ----------------
 REFRESH_SEC = 60.0
 MAX_WORKERS = 20
-# Look for IP_FILE in the current directory first, then fall back to package data
-IP_FILE = "ip.txt"
-if not os.path.exists(IP_FILE):
-    IP_FILE = str(pathlib.Path(pkg_resources.resource_filename('aruba_nms', 'data/ip.txt')))
+# Default IP file path in the package
+DEFAULT_IP_FILE = str(pathlib.Path(pkg_resources.resource_filename('aruba_nms', 'data/ip.txt')))
 
 # Column definitions
 COLUMNS = [
@@ -228,10 +226,11 @@ def collect(ip,u,p,comm)->Dict[str,Any]:
             "vendor":"N/A","model":"N/A","serial":"N/A"}
 
 # ---------------- Polling ----------------
-def read_ips():
-    with open(IP_FILE,"r",encoding="utf-8") as f:
-        ips=[ln.strip() for ln in f if ln.strip()]
-    return sorted(ips,key=lambda x: ip_address(x))
+def read_ips(ip_file_path):
+    """Read IP addresses from a file path"""
+    with open(ip_file_path, "r", encoding="utf-8") as f:
+        ips = [ln.strip() for ln in f if ln.strip()]
+    return sorted(ips, key=lambda x: ip_address(x))
 
 def poll_all(ips, u, p, comm, previous_states=None):
     """Poll all devices with awareness of previous states"""
@@ -310,6 +309,9 @@ class NmsApp:
         self.blink_timer = None
         self.blink_state = False  # For blinking icons
         
+        # Current IP file path (default to the package data file)
+        self.ip_file_path = DEFAULT_IP_FILE
+        
         # Variables for tracking sorting
         self.sort_column = "ip"  # Default sort column
         self.sort_reverse = False  # Default sort direction (ascending)
@@ -345,6 +347,10 @@ class NmsApp:
         # Add export button
         self.export_btn = ttk.Button(self.control_frame, text="Export to CSV", command=self.export_to_csv)
         self.export_btn.pack(side=tk.RIGHT, padx=5)
+        
+        # Add open IP file button
+        self.open_ip_btn = ttk.Button(self.control_frame, text="Open IP File", command=self.open_ip_file)
+        self.open_ip_btn.pack(side=tk.LEFT, padx=5)
         
         # Add settings button
         self.settings_btn = ttk.Button(self.control_frame, text="Settings", command=self.open_settings)
@@ -537,6 +543,18 @@ class NmsApp:
             if self.api_user and self.api_pass:
                 self.refresh_data()
 
+    def open_ip_file(self):
+        """Open file dialog to select an IP file"""
+        file_path = filedialog.askopenfilename(
+            title="Select IP File",
+            filetypes=[("Text files", "*.txt"), ("All files", "*.*")]
+        )
+        if file_path:
+            self.ip_file_path = file_path
+            self.status_var.set(f"Loaded IP file: {os.path.basename(self.ip_file_path)}")
+            # Refresh data with the new IP file
+            self.refresh_data()
+    
     def refresh_data(self):
         """Refresh the device data"""
         if not self.api_user or not self.api_pass:
@@ -544,18 +562,18 @@ class NmsApp:
                                   "Please set your API username and password in Settings.")
             return
         
-        self.status_var.set("Reading IP file...")
+        self.status_var.set(f"Reading IP file: {os.path.basename(self.ip_file_path)}...")
         self.root.update_idletasks()
         
         try:
-            ips = read_ips()
+            ips = read_ips(self.ip_file_path)
         except Exception as e:
-            messagebox.showerror("Error", f"Failed to read {IP_FILE}: {e}")
+            messagebox.showerror("Error", f"Failed to read {os.path.basename(self.ip_file_path)}: {e}")
             self.status_var.set("Ready")
             return
         
         if not ips:
-            messagebox.showinfo("No IPs", f"No IP addresses found in {IP_FILE}")
+            messagebox.showinfo("No IPs", f"No IP addresses found in {os.path.basename(self.ip_file_path)}")
             self.status_var.set("Ready")
             return
         
@@ -917,14 +935,14 @@ class SettingsDialog:
 
 def main():
     # Create sample IP file if it doesn't exist
-    if not os.path.exists(IP_FILE):
+    if not os.path.exists(DEFAULT_IP_FILE):
         # Try to create the data directory if it's a package installation
         try:
-            data_dir = os.path.dirname(IP_FILE)
+            data_dir = os.path.dirname(DEFAULT_IP_FILE)
             if not os.path.exists(data_dir):
                 os.makedirs(data_dir, exist_ok=True)
                 
-            with open(IP_FILE, "w") as f:
+            with open(DEFAULT_IP_FILE, "w") as f:
                 f.write("192.168.1.1\n")
                 f.write("192.168.1.2\n")
                 f.write("10.0.0.1\n")
