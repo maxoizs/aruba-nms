@@ -9,12 +9,12 @@ nms_gui.py - GUI version of NMS Live Monitor
 - Live updates with periodic refresh
 """
 
-import os, sys, re, time
+import os, sys, re, time, csv
 from ipaddress import ip_address
 from typing import Dict, Any, List
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import tkinter as tk
-from tkinter import ttk, messagebox, simpledialog, Canvas
+from tkinter import ttk, messagebox, simpledialog, Canvas, filedialog
 import base64, io
 from PIL import Image, ImageTk, ImageDraw  # For icon creation
 import requests, urllib3
@@ -334,6 +334,10 @@ class NmsApp:
         # Add refresh button
         self.refresh_btn = ttk.Button(self.control_frame, text="Refresh Now", command=self.refresh_data)
         self.refresh_btn.pack(side=tk.RIGHT, padx=5)
+        
+        # Add export button
+        self.export_btn = ttk.Button(self.control_frame, text="Export to CSV", command=self.export_to_csv)
+        self.export_btn.pack(side=tk.RIGHT, padx=5)
         
         # Add settings button
         self.settings_btn = ttk.Button(self.control_frame, text="Settings", command=self.open_settings)
@@ -803,6 +807,42 @@ class NmsApp:
                 self.tree.heading(column_name, text=f"{heading_text}{indicator}")
             else:
                 self.tree.heading(column_name, text=heading_text)
+    
+    def export_to_csv(self):
+        """Export the current device data to a CSV file"""
+        if not self.tree.get_children():
+            messagebox.showinfo("No Data", "There is no data to export.")
+            return
+        
+        # Ask user for the file location to save
+        file_path = filedialog.asksaveasfilename(
+            defaultextension=".csv",
+            filetypes=[("CSV files", "*.csv"), ("All files", "*.*")],
+            title="Save CSV Export"
+        )
+        
+        if not file_path:  # User cancelled
+            return
+        
+        try:
+            with open(file_path, 'w', newline='', encoding='utf-8') as csvfile:
+                # Create CSV writer
+                csv_writer = csv.writer(csvfile)
+                
+                # Write header row
+                header = [col["text"] for col in COLUMNS[1:]]  # Skip icon column, use column text for headers
+                csv_writer.writerow(header)
+                
+                # Write data rows
+                for item_id in self.tree.get_children():
+                    # Get values for each column
+                    values = [self.tree.set(item_id, col["id"]) for col in COLUMNS[1:]]
+                    csv_writer.writerow(values)
+                
+            messagebox.showinfo("Export Successful", f"Data exported successfully to {file_path}")
+            
+        except Exception as e:
+            messagebox.showerror("Export Error", f"An error occurred during export: {str(e)}")
 
 
 class SettingsDialog:
