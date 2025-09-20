@@ -9,24 +9,29 @@ nms_gui.py - GUI version of NMS Live Monitor
 - Live updates with periodic refresh
 """
 
-import os, sys, re, time
+import os, sys, re, time, csv
 from ipaddress import ip_address
 from typing import Dict, Any, List
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import tkinter as tk
-from tkinter import ttk, messagebox, simpledialog, Canvas
+from tkinter import ttk, messagebox, simpledialog, Canvas, filedialog
 import base64, io
 from PIL import Image, ImageTk, ImageDraw  # For icon creation
 import requests, urllib3
 from ping3 import ping
 from pysnmp.hlapi import *
 
+# When running as a package, we need to handle file paths differently
+import pkg_resources
+import pathlib
+
 urllib3.disable_warnings()
 
 # ---------------- Configuration ----------------
 REFRESH_SEC = 60.0
 MAX_WORKERS = 20
-IP_FILE = "ip.txt"
+# Default IP file path in the package
+DEFAULT_IP_FILE = str(pathlib.Path(pkg_resources.resource_filename('aruba_nms', 'data/ip.txt')))
 
 # Column definitions
 COLUMNS = [
@@ -46,7 +51,8 @@ STATUS_TYPES = {
     "Online": {"color": "#e0ffe0", "blink": False},
     "Offline": {"color": "#ffe0e0", "blink": True},  # Now Offline will blink too
     "Failed": {"color": "#fff0c0", "blink": False},
-    "Off-On": {"color": "#ffffc0", "blink": True}  # Transitional state that blinks
+    "Off-On": {"color": "#ffffc0", "blink": True},  # Transitional state that blinks
+    "Polling": {"color": "#e0e0ff", "blink": True}  # Polling status that blinks
 }
 
 # ---------------- SNMP helpers ----------------
@@ -171,6 +177,7 @@ def norm_status(s):
         if "on" in s: return "Off-On"  # Transitional state
         return "Offline"
     if s.startswith("fail"): return "Failed"
+    if s.startswith("poll"): return "Polling"
     return "Failed"
 
 # ---------------- Device worker ----------------
@@ -219,16 +226,26 @@ def collect(ip,u,p,comm)->Dict[str,Any]:
             "vendor":"N/A","model":"N/A","serial":"N/A"}
 
 # ---------------- Polling ----------------
-def read_ips():
-    with open(IP_FILE,"r",encoding="utf-8") as f:
-        ips=[ln.strip() for ln in f if ln.strip()]
-    return sorted(ips,key=lambda x: ip_address(x))
+def read_ips(ip_file_path):
+    """Read IP addresses from a file path"""
+    with open(ip_file_path, "r", encoding="utf-8") as f:
+        ips = [ln.strip() for ln in f if ln.strip()]
+    return sorted(ips, key=lambda x: ip_address(x))
 
 def poll_all(ips, u, p, comm, previous_states=None):
     """Poll all devices with awareness of previous states"""
-    out = []
     previous_states = previous_states or {}
     
+    # First, return a placeholder for each IP to display them all
+    for ip in ips:
+        yield {
+            "ip": ip,
+            "status": "Polling",  # Special status for IPs being polled
+            "cpu": "...", "mem": "...", "uptime": "...",
+            "vendor": "...", "model": "...", "serial": "..."
+        }
+    
+    # Then start polling each IP asynchronously
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
         futs = {ex.submit(collect, ip, u, p, comm): ip for ip in ips}
         for fut in as_completed(futs):
@@ -244,33 +261,37 @@ def poll_all(ips, u, p, comm, previous_states=None):
                     if prev == "Offline" and curr == "Online":
                         result["status"] = "Off-On"
                 
-                out.append(result)
+                # Update previous state for this IP
+                previous_states[ip] = result.get("status")
+                
+                yield result
             except Exception:
-                out.append({
+                result = {
                     "ip": ip,
                     "status": "Failed",
                     "cpu": "N/A", "mem": "N/A", "uptime": "N/A",
                     "vendor": "N/A", "model": "N/A", "serial": "N/A"
-                })
-    
-    # Update previous states for next poll
-    for device in out:
-        previous_states[device["ip"]] = device["status"]
-        
-    return out
+                }
+                
+                # Update previous state for this IP
+                previous_states[ip] = "Failed"
+                
+                yield result
 
 # ---------------- Sorting & counts ----------------
 def sort_devs(devs):
     for d in devs: d["status"]=norm_status(d.get("status",""))
-    order={"Offline":0,"Failed":1,"Online":2}
-    return sorted(devs,key=lambda d:(order.get(d["status"],3), ip_address(d["ip"])))
+    # Default sorting order (can be overridden by column sorting)
+    order={"Polling": 0, "Offline":1, "Failed":2, "Online":3, "Off-On":4}
+    return sorted(devs,key=lambda d:(order.get(d["status"],5), ip_address(d["ip"])))
 
 def counts(devs):
     t=len(devs)
     o=sum(1 for d in devs if norm_status(d["status"])=="Online")
     f=sum(1 for d in devs if norm_status(d["status"])=="Failed")
     off=sum(1 for d in devs if norm_status(d["status"])=="Offline")
-    return t,o,f,off
+    p=sum(1 for d in devs if norm_status(d["status"])=="Polling")
+    return t,o,f,off,p
 
 # ---------------- GUI Application ----------------
 class NmsApp:
@@ -287,6 +308,13 @@ class NmsApp:
         self.refresh_timer = None
         self.blink_timer = None
         self.blink_state = False  # For blinking icons
+        
+        # Current IP file path (default to the package data file)
+        self.ip_file_path = DEFAULT_IP_FILE
+        
+        # Variables for tracking sorting
+        self.sort_column = "ip"  # Default sort column
+        self.sort_reverse = False  # Default sort direction (ascending)
         
         # Create status icons
         self.icons = self.create_status_icons()
@@ -316,6 +344,14 @@ class NmsApp:
         self.refresh_btn = ttk.Button(self.control_frame, text="Refresh Now", command=self.refresh_data)
         self.refresh_btn.pack(side=tk.RIGHT, padx=5)
         
+        # Add export button
+        self.export_btn = ttk.Button(self.control_frame, text="Export to CSV", command=self.export_to_csv)
+        self.export_btn.pack(side=tk.RIGHT, padx=5)
+        
+        # Add open IP file button
+        self.open_ip_btn = ttk.Button(self.control_frame, text="Open IP File", command=self.open_ip_file)
+        self.open_ip_btn.pack(side=tk.LEFT, padx=5)
+        
         # Add settings button
         self.settings_btn = ttk.Button(self.control_frame, text="Settings", command=self.open_settings)
         self.settings_btn.pack(side=tk.RIGHT, padx=5)
@@ -342,7 +378,9 @@ class NmsApp:
         # Set column headings and widths
         for col in COLUMNS[1:]:  # Skip icon column
             self.tree.column(col["id"], width=col["width"], anchor=tk.W)
-            self.tree.heading(col["id"], text=col["text"], anchor=tk.W)
+            # Bind the heading click to sort method with a lambda that passes the column ID
+            self.tree.heading(col["id"], text=col["text"], anchor=tk.W, 
+                             command=lambda col_id=col["id"]: self.sort_by_column(col_id))
             
         # Style configuration for proper padding and alignment
         style = ttk.Style()
@@ -439,6 +477,34 @@ class NmsApp:
             draw.polygon(arrow_points, fill=(200, 200, 200))
         icons["Off-On_off"] = ImageTk.PhotoImage(img)
         
+        # Polling icon - ON state (blue pulsing circle with hourglass)
+        img = Image.new('RGBA', (size, size), (0, 0, 0, 0))
+        draw = ImageDraw.Draw(img)
+        # Bright blue circle
+        draw.ellipse([0, 0, size, size], fill=(80, 80, 240), outline=(60, 60, 180), width=1)
+        # Add hourglass symbol
+        if size >= 16:
+            # Hourglass outline
+            draw.polygon([(size//3, size//3), (size*2//3, size//3), (size*2//3, size*2//3), 
+                          (size//3, size*2//3)], outline=(255, 255, 255), width=1)
+            # Center line
+            draw.line([(size//3, size//2), (size*2//3, size//2)], fill=(255, 255, 255), width=1)
+        icons["Polling_on"] = ImageTk.PhotoImage(img)
+        
+        # Polling icon - OFF state (dimmed blue circle with hourglass)
+        img = Image.new('RGBA', (size, size), (0, 0, 0, 0))
+        draw = ImageDraw.Draw(img)
+        # Dimmed blue circle
+        draw.ellipse([0, 0, size, size], fill=(60, 60, 180), outline=(60, 60, 180), width=1)
+        # Add hourglass symbol (dimmed)
+        if size >= 16:
+            # Hourglass outline
+            draw.polygon([(size//3, size//3), (size*2//3, size//3), (size*2//3, size*2//3), 
+                          (size//3, size*2//3)], outline=(200, 200, 200), width=1)
+            # Center line
+            draw.line([(size//3, size//2), (size*2//3, size//2)], fill=(200, 200, 200), width=1)
+        icons["Polling_off"] = ImageTk.PhotoImage(img)
+        
         return icons
     
     def toggle_blink(self):
@@ -477,6 +543,18 @@ class NmsApp:
             if self.api_user and self.api_pass:
                 self.refresh_data()
 
+    def open_ip_file(self):
+        """Open file dialog to select an IP file"""
+        file_path = filedialog.askopenfilename(
+            title="Select IP File",
+            filetypes=[("Text files", "*.txt"), ("All files", "*.*")]
+        )
+        if file_path:
+            self.ip_file_path = file_path
+            self.status_var.set(f"Loaded IP file: {os.path.basename(self.ip_file_path)}")
+            # Refresh data with the new IP file
+            self.refresh_data()
+    
     def refresh_data(self):
         """Refresh the device data"""
         if not self.api_user or not self.api_pass:
@@ -484,32 +562,41 @@ class NmsApp:
                                   "Please set your API username and password in Settings.")
             return
         
-        self.status_var.set("Reading IP file...")
+        self.status_var.set(f"Reading IP file: {os.path.basename(self.ip_file_path)}...")
         self.root.update_idletasks()
         
         try:
-            ips = read_ips()
+            ips = read_ips(self.ip_file_path)
         except Exception as e:
-            messagebox.showerror("Error", f"Failed to read {IP_FILE}: {e}")
+            messagebox.showerror("Error", f"Failed to read {os.path.basename(self.ip_file_path)}: {e}")
             self.status_var.set("Ready")
             return
         
         if not ips:
-            messagebox.showinfo("No IPs", f"No IP addresses found in {IP_FILE}")
+            messagebox.showinfo("No IPs", f"No IP addresses found in {os.path.basename(self.ip_file_path)}")
             self.status_var.set("Ready")
             return
         
-        self.status_var.set(f"Polling {len(ips)} devices...")
+        self.status_var.set(f"Preparing to poll {len(ips)} devices...")
         self.root.update_idletasks()
         
         # Start polling in a separate thread to keep UI responsive
         self.refresh_btn.config(state=tk.DISABLED)
         
+        # Clear the current treeview to prepare for the new data
+        for row in self.tree.get_children():
+            self.tree.delete(row)
+        
+        # Update last refresh time
+        refresh_time = time.strftime("%Y-%m-%d %H:%M:%S")
+        self.refresh_var.set(f"Last refresh: {refresh_time}")
+        
         def poll_thread():
-            # Pass previous states to track transitions
-            devices = poll_all(ips, self.api_user, self.api_pass, self.snmp_comm, self.previous_states)
-            # Update UI from the main thread
-            self.root.after(0, lambda: self.update_ui(devices))
+            # Get generator that will yield results as they arrive
+            result_generator = poll_all(ips, self.api_user, self.api_pass, self.snmp_comm, self.previous_states)
+            
+            # Start the async UI update process from the main thread
+            self.root.after(0, lambda: self.async_update_ui(result_generator))
         
         import threading
         thread = threading.Thread(target=poll_thread)
@@ -517,7 +604,7 @@ class NmsApp:
         thread.start()
 
     def update_ui(self, devices):
-        """Update the UI with new device data"""
+        """Update the UI with all device data at once"""
         self.devices = sort_devs(devices)
         
         # Update previous states dictionary
@@ -532,8 +619,8 @@ class NmsApp:
             self.tree.delete(row)
         
         # Update summary
-        t, o, f, off = counts(devices)
-        self.summary_var.set(f"Summary: Total: {t} | Online: {o} | Failed: {f} | Offline: {off}")
+        t, o, f, off, p = counts(devices)
+        self.summary_var.set(f"Summary: Total: {t} | Online: {o} | Failed: {f} | Offline: {off} | Polling: {p}")
         
         # Update last refresh time
         refresh_time = time.strftime("%Y-%m-%d %H:%M:%S")
@@ -541,36 +628,15 @@ class NmsApp:
         
         # Add device rows
         for device in self.devices:
-            status = device.get("status", "")
-            # Determine proper tags for styling
-            tags = [status.lower()]
-            
-            # Add blink tag if this status should blink
-            if status in STATUS_TYPES and STATUS_TYPES[status]["blink"]:
-                tags.append("blink")
-            
-            # Prepare values for data columns (all except icon)
-            values = []
-            for col in COLUMNS[1:]:  # Skip icon column
-                values.append(device.get(col["id"].lower(), "N/A"))
-            
-            # Get appropriate icon based on status
-            icon = None
-            if status == "Off-On":
-                # For blinking status, start with 'on' state
-                icon = self.icons["Off-On_on"]
-            elif status == "Offline":
-                # For offline status (which now blinks), start with 'on' state
-                icon = self.icons["Offline_on"]
-            elif status in self.icons:
-                icon = self.icons[status]
-            
-            # Insert row with icon in column #0 and values in data columns
-            item_id = self.tree.insert('', tk.END, text='', image=icon, values=values, tags=tuple(tags))
+            self._insert_or_update_device_row(device)
         
         # Configure colors for status tags
         for status_name, props in STATUS_TYPES.items():
             self.tree.tag_configure(status_name.lower(), background=props["color"])
+        
+        # Apply current sort settings
+        if self.sort_column:
+            self.sort_by_column(self.sort_column)
         
         self.status_var.set(f"Ready. {t} devices loaded.")
         self.refresh_btn.config(state=tk.NORMAL)
@@ -579,6 +645,229 @@ class NmsApp:
         if self.refresh_timer:
             self.root.after_cancel(self.refresh_timer)
         self.refresh_timer = self.root.after(int(REFRESH_SEC * 1000), self.refresh_data)
+    
+    def async_update_ui(self, result_generator):
+        """Process device results asynchronously as they arrive"""
+        # Dictionary to keep track of devices and their tree item IDs
+        ip_to_item = {}
+        polling_count = 0
+        completed_count = 0
+        total_count = 0
+        
+        def process_next_result():
+            nonlocal polling_count, completed_count, total_count
+            
+            try:
+                device = next(result_generator)
+                
+                # For first batch of results (IPs), just count them
+                if device.get("status") == "Polling":
+                    polling_count += 1
+                    total_count += 1
+                else:
+                    # This is a real result, decrement polling count and increment completed
+                    polling_count -= 1
+                    completed_count += 1
+                
+                # Insert or update the device in the treeview
+                item_id = ip_to_item.get(device.get("ip"))
+                if item_id:
+                    # Update existing row
+                    self._update_device_row(item_id, device)
+                else:
+                    # Insert new row
+                    item_id = self._insert_or_update_device_row(device)
+                    ip_to_item[device.get("ip")] = item_id
+                
+                # Update status bar with progress
+                self.status_var.set(
+                    f"Polling devices... {completed_count}/{total_count} completed, {polling_count} pending"
+                )
+                
+                # Schedule processing of next result
+                self.root.after(10, process_next_result)
+            
+            except StopIteration:
+                # All results processed
+                # Update summary counts
+                t = total_count
+                o = sum(1 for d in self.tree.get_children() if self.tree.item(d, 'values')[1] == "Online")
+                f = sum(1 for d in self.tree.get_children() if self.tree.item(d, 'values')[1] == "Failed")
+                off = sum(1 for d in self.tree.get_children() if self.tree.item(d, 'values')[1] == "Offline")
+                p = sum(1 for d in self.tree.get_children() if self.tree.item(d, 'values')[1] == "Polling")
+                
+                self.summary_var.set(f"Summary: Total: {t} | Online: {o} | Failed: {f} | Offline: {off} | Polling: {p}")
+                
+                # Apply current sort settings
+                if self.sort_column:
+                    self.sort_by_column(self.sort_column)
+                
+                self.status_var.set(f"Ready. {t} devices loaded.")
+                self.refresh_btn.config(state=tk.NORMAL)
+                
+                # Set timer for next refresh
+                if self.refresh_timer:
+                    self.root.after_cancel(self.refresh_timer)
+                self.refresh_timer = self.root.after(int(REFRESH_SEC * 1000), self.refresh_data)
+        
+        # Start the async processing
+        process_next_result()
+    
+    def _insert_or_update_device_row(self, device):
+        """Helper method to insert or update a device row in the treeview"""
+        status = device.get("status", "")
+        # Determine proper tags for styling
+        tags = [status.lower()]
+        
+        # Add blink tag if this status should blink
+        if status in STATUS_TYPES and STATUS_TYPES[status]["blink"]:
+            tags.append("blink")
+        
+        # Prepare values for data columns (all except icon)
+        values = []
+        for col in COLUMNS[1:]:  # Skip icon column
+            values.append(device.get(col["id"].lower(), "N/A"))
+        
+        # Get appropriate icon based on status
+        icon = None
+        if status == "Off-On":
+            # For blinking status, start with 'on' state
+            icon = self.icons["Off-On_on"]
+        elif status == "Offline":
+            # For offline status (which now blinks), start with 'on' state
+            icon = self.icons["Offline_on"]
+        elif status == "Polling":
+            # For polling status (which blinks), start with 'on' state
+            icon = self.icons["Polling_on"]
+        elif status in self.icons:
+            icon = self.icons[status]
+        
+        # Insert row with icon in column #0 and values in data columns
+        item_id = self.tree.insert('', tk.END, text='', image=icon, values=values, tags=tuple(tags))
+        return item_id
+    
+    def _update_device_row(self, item_id, device):
+        """Helper method to update an existing device row in the treeview"""
+        status = device.get("status", "")
+        # Determine proper tags for styling
+        tags = [status.lower()]
+        
+        # Add blink tag if this status should blink
+        if status in STATUS_TYPES and STATUS_TYPES[status]["blink"]:
+            tags.append("blink")
+        
+        # Prepare values for data columns (all except icon)
+        values = []
+        for col in COLUMNS[1:]:  # Skip icon column
+            values.append(device.get(col["id"].lower(), "N/A"))
+        
+        # Get appropriate icon based on status
+        icon = None
+        if status == "Off-On":
+            # For blinking status, start with 'on' state
+            icon = self.icons["Off-On_on"]
+        elif status == "Offline":
+            # For offline status (which now blinks), start with 'on' state
+            icon = self.icons["Offline_on"]
+        elif status == "Polling":
+            # For polling status (which blinks), start with 'on' state
+            icon = self.icons["Polling_on"]
+        elif status in self.icons:
+            icon = self.icons[status]
+            
+        # Update the row with new values
+        self.tree.item(item_id, image=icon, values=values, tags=tuple(tags))
+    
+    def sort_by_column(self, column_id):
+        """Sort the treeview by the specified column"""
+        # If clicking on the same column, toggle sort direction
+        if self.sort_column == column_id:
+            self.sort_reverse = not self.sort_reverse
+        else:
+            # Otherwise, sort by the new column in ascending order
+            self.sort_column = column_id
+            self.sort_reverse = False
+        
+        # Get all items from the treeview
+        item_list = [(self.tree.set(item_id, column_id), item_id) for item_id in self.tree.get_children('')]
+        
+        # Apply special sorting rules for certain columns
+        if column_id == "status":
+            # For status column, sort by status priority
+            status_order = {"Online": 0, "Off-On": 1, "Failed": 2, "Offline": 3, "Polling": 4}
+            item_list = [(status_order.get(self.tree.set(item_id, column_id), 999), item_id) for item_id in self.tree.get_children('')]
+        elif column_id == "ip":
+            # For IP column, sort by IP address numerically
+            try:
+                item_list = [(ip_address(self.tree.set(item_id, column_id)), item_id) for item_id in self.tree.get_children('')]
+            except:
+                # If IP parsing fails, fall back to string sorting
+                pass
+        elif column_id in ["cpu", "mem"]:
+            # For percentage columns, strip the % sign and sort numerically
+            def extract_numeric(value):
+                try:
+                    # Remove % and convert to float
+                    return float(value.replace('%', ''))
+                except (ValueError, AttributeError):
+                    return -1  # For "N/A" or other non-numeric values
+            
+            item_list = [(extract_numeric(self.tree.set(item_id, column_id)), item_id) for item_id in self.tree.get_children('')]
+        
+        # Sort the list
+        item_list.sort(reverse=self.sort_reverse)
+        
+        # Rearrange items in the treeview according to the sort
+        for index, (val, item_id) in enumerate(item_list):
+            self.tree.move(item_id, '', index)
+        
+        # Update column headings to show sort indicators
+        for col in COLUMNS[1:]:  # Skip icon column
+            column_name = col["id"]
+            heading_text = col["text"]
+            
+            # Add sort indicator to the sorted column
+            if column_name == self.sort_column:
+                indicator = " ▼" if self.sort_reverse else " ▲"
+                self.tree.heading(column_name, text=f"{heading_text}{indicator}")
+            else:
+                self.tree.heading(column_name, text=heading_text)
+    
+    def export_to_csv(self):
+        """Export the current device data to a CSV file"""
+        if not self.tree.get_children():
+            messagebox.showinfo("No Data", "There is no data to export.")
+            return
+        
+        # Ask user for the file location to save
+        file_path = filedialog.asksaveasfilename(
+            defaultextension=".csv",
+            filetypes=[("CSV files", "*.csv"), ("All files", "*.*")],
+            title="Save CSV Export"
+        )
+        
+        if not file_path:  # User cancelled
+            return
+        
+        try:
+            with open(file_path, 'w', newline='', encoding='utf-8') as csvfile:
+                # Create CSV writer
+                csv_writer = csv.writer(csvfile)
+                
+                # Write header row
+                header = [col["text"] for col in COLUMNS[1:]]  # Skip icon column, use column text for headers
+                csv_writer.writerow(header)
+                
+                # Write data rows
+                for item_id in self.tree.get_children():
+                    # Get values for each column
+                    values = [self.tree.set(item_id, col["id"]) for col in COLUMNS[1:]]
+                    csv_writer.writerow(values)
+                
+            messagebox.showinfo("Export Successful", f"Data exported successfully to {file_path}")
+            
+        except Exception as e:
+            messagebox.showerror("Export Error", f"An error occurred during export: {str(e)}")
 
 
 class SettingsDialog:
@@ -644,14 +933,26 @@ class SettingsDialog:
         self.dialog.destroy()
 
 
-if __name__ == "__main__":
+def main():
     # Create sample IP file if it doesn't exist
-    if not os.path.exists(IP_FILE):
-        with open(IP_FILE, "w") as f:
-            f.write("192.168.1.1\n")
-            f.write("192.168.1.2\n")
-            f.write("10.0.0.1\n")
+    if not os.path.exists(DEFAULT_IP_FILE):
+        # Try to create the data directory if it's a package installation
+        try:
+            data_dir = os.path.dirname(DEFAULT_IP_FILE)
+            if not os.path.exists(data_dir):
+                os.makedirs(data_dir, exist_ok=True)
+                
+            with open(DEFAULT_IP_FILE, "w") as f:
+                f.write("192.168.1.1\n")
+                f.write("192.168.1.2\n")
+                f.write("10.0.0.1\n")
+        except Exception as e:
+            print(f"Warning: Could not create sample IP file: {e}")
         
     root = tk.Tk()
     app = NmsApp(root)
     root.mainloop()
+
+
+if __name__ == "__main__":
+    main()
