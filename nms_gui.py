@@ -5,6 +5,7 @@ nms_gui.py - GUI version of NMS Live Monitor
 - Tkinter-based UI with scrollable table
 - Clean refresh without flicker
 - Color indicators for status
+- Status icons with blinking for transitional states
 - Live updates with periodic refresh
 """
 
@@ -13,11 +14,12 @@ from ipaddress import ip_address
 from typing import Dict, Any, List
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import tkinter as tk
-from tkinter import ttk, messagebox, simpledialog
+from tkinter import ttk, messagebox, simpledialog, Canvas
+import base64, io
+from PIL import Image, ImageTk, ImageDraw  # For icon creation
 import requests, urllib3
 from ping3 import ping
 from pysnmp.hlapi import *
-
 
 urllib3.disable_warnings()
 
@@ -28,6 +30,7 @@ IP_FILE = "ip.txt"
 
 # Column definitions
 COLUMNS = [
+    {"id": "icon", "text": "", "width": 30},  # New icon column
     {"id": "ip", "text": "IP Address", "width": 120},
     {"id": "status", "text": "Status", "width": 80},
     {"id": "vendor", "text": "Vendor", "width": 100},
@@ -37,6 +40,14 @@ COLUMNS = [
     {"id": "mem", "text": "Mem %", "width": 60},
     {"id": "uptime", "text": "Uptime", "width": 100}
 ]
+
+# Status definitions with icons
+STATUS_TYPES = {
+    "Online": {"color": "#e0ffe0", "blink": False},
+    "Offline": {"color": "#ffe0e0", "blink": True},  # Now Offline will blink too
+    "Failed": {"color": "#fff0c0", "blink": False},
+    "Off-On": {"color": "#ffffc0", "blink": True}  # Transitional state that blinks
+}
 
 # ---------------- SNMP helpers ----------------
 def snmp_get(ip, comm, oid, timeout=1, retries=1):
@@ -156,7 +167,9 @@ def norm_status(s):
     if not s: return "Failed"
     s=s.strip().lower()
     if s.startswith("on"): return "Online"
-    if s.startswith("off"): return "Offline"
+    if s.startswith("off"):
+        if "on" in s: return "Off-On"  # Transitional state
+        return "Offline"
     if s.startswith("fail"): return "Failed"
     return "Failed"
 
@@ -164,19 +177,44 @@ def norm_status(s):
 def collect(ip,u,p,comm)->Dict[str,Any]:
     try: rtt=ping(ip,timeout=1)
     except Exception: rtt=None
+    
+    # Check for previously known device to detect state transitions
+    last_status = None
+    
     if rtt is None:
-        return {"ip":ip,"status":"Offline","cpu":"N/A","mem":"N/A","uptime":"N/A",
+        status = "Offline"
+        # You could add logic here to detect Off-On transitions if needed
+        # For example, if device was previously online, set status to "Off-On"
+        
+        return {"ip":ip,"status":status,"cpu":"N/A","mem":"N/A","uptime":"N/A",
                 "vendor":"N/A","model":"N/A","serial":"N/A"}
+                
     d=aruba_api(ip,u,p)
     if d:
+        # Check for transitioning device (e.g., recently booted)
+        uptime = d.get("uptime", "N/A")
+        # If uptime is very low, device might be in transition
+        if isinstance(uptime, str) and "0d" in uptime and "0h" in uptime and "m" in uptime:
+            try:
+                # Extract minutes
+                mins = int(uptime.split("m")[0].strip().split(" ")[-1])
+                if mins < 5:  # If device booted less than 5 minutes ago
+                    return {"ip":ip,"status":"Off-On","cpu":d.get("cpu","N/A"),"mem":d.get("memory","N/A"),
+                            "uptime":uptime,"vendor":d.get("vendor","N/A"),
+                            "model":d.get("model","N/A"),"serial":d.get("serial","N/A")}
+            except (ValueError, IndexError):
+                pass  # If parsing fails, continue with normal status
+                
         return {"ip":ip,"status":"Online","cpu":d.get("cpu","N/A"),"mem":d.get("memory","N/A"),
                 "uptime":d.get("uptime","N/A"),"vendor":d.get("vendor","N/A"),
                 "model":d.get("model","N/A"),"serial":d.get("serial","N/A")}
+                
     d=snmp_data(ip,comm)
     if d:
         return {"ip":ip,"status":"Online","cpu":d.get("cpu","N/A"),"mem":d.get("memory","N/A"),
                 "uptime":d.get("uptime","N/A"),"vendor":d.get("vendor","N/A"),
                 "model":d.get("model","N/A"),"serial":d.get("serial","N/A")}
+                
     return {"ip":ip,"status":"Failed","cpu":"N/A","mem":"N/A","uptime":"N/A",
             "vendor":"N/A","model":"N/A","serial":"N/A"}
 
@@ -186,14 +224,39 @@ def read_ips():
         ips=[ln.strip() for ln in f if ln.strip()]
     return sorted(ips,key=lambda x: ip_address(x))
 
-def poll_all(ips,u,p,comm):
-    out=[]
+def poll_all(ips, u, p, comm, previous_states=None):
+    """Poll all devices with awareness of previous states"""
+    out = []
+    previous_states = previous_states or {}
+    
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
-        futs={ex.submit(collect,ip,u,p,comm):ip for ip in ips}
+        futs = {ex.submit(collect, ip, u, p, comm): ip for ip in ips}
         for fut in as_completed(futs):
-            try: out.append(fut.result())
-            except Exception: out.append({"ip":futs[fut],"status":"Failed","cpu":"N/A","mem":"N/A","uptime":"N/A",
-                                          "vendor":"N/A","model":"N/A","serial":"N/A"})
+            ip = futs[fut]
+            try:
+                result = fut.result()
+                # Check for state transitions
+                if ip in previous_states:
+                    prev = previous_states[ip]
+                    curr = result.get("status")
+                    
+                    # Detect offline to online transition
+                    if prev == "Offline" and curr == "Online":
+                        result["status"] = "Off-On"
+                
+                out.append(result)
+            except Exception:
+                out.append({
+                    "ip": ip,
+                    "status": "Failed",
+                    "cpu": "N/A", "mem": "N/A", "uptime": "N/A",
+                    "vendor": "N/A", "model": "N/A", "serial": "N/A"
+                })
+    
+    # Update previous states for next poll
+    for device in out:
+        previous_states[device["ip"]] = device["status"]
+        
     return out
 
 # ---------------- Sorting & counts ----------------
@@ -220,7 +283,13 @@ class NmsApp:
         self.api_pass = ""
         self.snmp_comm = "public"
         self.devices = []
+        self.previous_states = {}  # Store previous device states
         self.refresh_timer = None
+        self.blink_timer = None
+        self.blink_state = False  # For blinking icons
+        
+        # Create status icons
+        self.icons = self.create_status_icons()
         
         # Create the main frame
         self.main_frame = ttk.Frame(root)
@@ -264,15 +333,20 @@ class NmsApp:
         self.scrollbar.config(command=self.tree.yview)
         self.tree.pack(fill=tk.BOTH, expand=True)
         
-        # Define columns
-        column_ids = [col["id"] for col in COLUMNS]
+        # Define columns - use #0 for icon and columns for data
+        column_ids = [col["id"] for col in COLUMNS[1:]]  # Skip the icon column
         self.tree['columns'] = column_ids
-        self.tree.column('#0', width=0, stretch=tk.NO)  # Hidden column
+        self.tree.column('#0', width=40, stretch=tk.NO, anchor=tk.CENTER)  # Use column #0 for icons with proper centering
+        self.tree.heading('#0', text='')
         
         # Set column headings and widths
-        for col in COLUMNS:
+        for col in COLUMNS[1:]:  # Skip icon column
             self.tree.column(col["id"], width=col["width"], anchor=tk.W)
             self.tree.heading(col["id"], text=col["text"], anchor=tk.W)
+            
+        # Style configuration for proper padding and alignment
+        style = ttk.Style()
+        style.configure("Treeview", rowheight=24)  # Increase row height for better icon display
         
         # Status bar at the bottom
         self.status_var = tk.StringVar(value="Ready")
@@ -281,6 +355,117 @@ class NmsApp:
         
         # Show login dialog at startup
         self.root.after(100, self.open_settings)
+        
+        # Start blinking timer
+        self.toggle_blink()
+    
+    def create_status_icons(self, size=22):
+        """Create icons for different status types"""
+        icons = {}
+        
+        # Online icon (green circle with checkmark)
+        img = Image.new('RGBA', (size, size), (0, 0, 0, 0))
+        draw = ImageDraw.Draw(img)
+        # Green circle
+        draw.ellipse([0, 0, size, size], fill=(0, 180, 0), outline=(0, 120, 0), width=1)
+        # Add white checkmark
+        if size >= 16:  # Only add details if icon is large enough
+            check_points = [(size//4, size//2), (size//2-2, size*3//4), (size*3//4, size//4)]
+            draw.line(check_points, fill=(255, 255, 255), width=2)
+        icons["Online"] = ImageTk.PhotoImage(img)
+        
+        # Offline icon - ON state (bright red circle with X)
+        img = Image.new('RGBA', (size, size), (0, 0, 0, 0))
+        draw = ImageDraw.Draw(img)
+        # Bright red circle
+        draw.ellipse([0, 0, size, size], fill=(220, 0, 0), outline=(120, 0, 0), width=1)
+        # Add white X
+        if size >= 16:
+            draw.line([(size//4, size//4), (size*3//4, size*3//4)], fill=(255, 255, 255), width=2)
+            draw.line([(size*3//4, size//4), (size//4, size*3//4)], fill=(255, 255, 255), width=2)
+        icons["Offline_on"] = ImageTk.PhotoImage(img)
+        
+        # Offline icon - OFF state (dimmed red circle with X)
+        img = Image.new('RGBA', (size, size), (0, 0, 0, 0))
+        draw = ImageDraw.Draw(img)
+        # Dimmed red circle
+        draw.ellipse([0, 0, size, size], fill=(140, 0, 0), outline=(120, 0, 0), width=1)
+        # Add white X (slightly dimmed)
+        if size >= 16:
+            draw.line([(size//4, size//4), (size*3//4, size*3//4)], fill=(220, 220, 220), width=2)
+            draw.line([(size*3//4, size//4), (size//4, size*3//4)], fill=(220, 220, 220), width=2)
+        icons["Offline_off"] = ImageTk.PhotoImage(img)
+        
+        # For backward compatibility, keep the non-blinking version
+        icons["Offline"] = icons["Offline_on"]
+        
+        # Failed icon (yellow triangle with !)
+        img = Image.new('RGBA', (size, size), (0, 0, 0, 0))
+        draw = ImageDraw.Draw(img)
+        # Yellow triangle
+        draw.polygon([(size//2, 0), (size, size-1), (0, size-1)], 
+                    fill=(240, 180, 0), outline=(180, 140, 0), width=1)
+        # Add exclamation mark
+        if size >= 16:
+            # Vertical line
+            draw.line([(size//2, size//5), (size//2, size*2//3)], fill=(0, 0, 0), width=2)
+            # Dot
+            draw.ellipse([(size//2-1, size*3//4-1), (size//2+1, size*3//4+1)], fill=(0, 0, 0))
+        icons["Failed"] = ImageTk.PhotoImage(img)
+        
+        # Off-On icon - ON state (orange pulsing circle)
+        img = Image.new('RGBA', (size, size), (0, 0, 0, 0))
+        draw = ImageDraw.Draw(img)
+        # Bright orange circle
+        draw.ellipse([0, 0, size, size], fill=(255, 140, 0), outline=(200, 100, 0), width=1)
+        # Add up arrow
+        if size >= 16:
+            arrow_points = [(size//2, size//4), (size//4, size//2), (size*3//8, size//2),
+                           (size*3//8, size*3//4), (size*5//8, size*3//4), 
+                           (size*5//8, size//2), (size*3//4, size//2)]
+            draw.polygon(arrow_points, fill=(255, 255, 255))
+        icons["Off-On_on"] = ImageTk.PhotoImage(img)
+        
+        # Off-On icon - OFF state (dimmed orange circle)
+        img = Image.new('RGBA', (size, size), (0, 0, 0, 0))
+        draw = ImageDraw.Draw(img)
+        # Dimmed orange circle
+        draw.ellipse([0, 0, size, size], fill=(180, 100, 0), outline=(200, 100, 0), width=1)
+        # Add faded up arrow
+        if size >= 16:
+            arrow_points = [(size//2, size//4), (size//4, size//2), (size*3//8, size//2),
+                           (size*3//8, size*3//4), (size*5//8, size*3//4), 
+                           (size*5//8, size//2), (size*3//4, size//2)]
+            draw.polygon(arrow_points, fill=(200, 200, 200))
+        icons["Off-On_off"] = ImageTk.PhotoImage(img)
+        
+        return icons
+    
+    def toggle_blink(self):
+        """Toggle the blink state for blinking items"""
+        self.blink_state = not self.blink_state
+        self.update_blinking_items()
+        # Schedule next blink after 500ms
+        self.blink_timer = self.root.after(500, self.toggle_blink)
+    
+    def update_blinking_items(self):
+        """Update any UI elements that need to blink"""
+        for item_id in self.tree.get_children():
+            tags = self.tree.item(item_id, 'tags')
+            if 'blink' in tags:
+                status_col = self.tree.item(item_id, 'values')[1]  # Get status value (index 1 now)
+                
+                # Handle Off-On blinking
+                if status_col == "Off-On":
+                    icon_state = "Off-On_on" if self.blink_state else "Off-On_off"
+                    # Update the icon in column #0
+                    self.tree.item(item_id, image=self.icons[icon_state])
+                
+                # Handle Offline blinking
+                elif status_col == "Offline":
+                    icon_state = "Offline_on" if self.blink_state else "Offline_off"
+                    # Update the icon in column #0
+                    self.tree.item(item_id, image=self.icons[icon_state])
 
     def open_settings(self):
         """Open settings dialog to set credentials"""
@@ -321,7 +506,8 @@ class NmsApp:
         self.refresh_btn.config(state=tk.DISABLED)
         
         def poll_thread():
-            devices = poll_all(ips, self.api_user, self.api_pass, self.snmp_comm)
+            # Pass previous states to track transitions
+            devices = poll_all(ips, self.api_user, self.api_pass, self.snmp_comm, self.previous_states)
             # Update UI from the main thread
             self.root.after(0, lambda: self.update_ui(devices))
         
@@ -333,6 +519,13 @@ class NmsApp:
     def update_ui(self, devices):
         """Update the UI with new device data"""
         self.devices = sort_devs(devices)
+        
+        # Update previous states dictionary
+        for device in devices:
+            ip = device.get("ip")
+            status = device.get("status")
+            if ip and status:
+                self.previous_states[ip] = status
         
         # Clear the treeview
         for row in self.tree.get_children():
@@ -349,19 +542,35 @@ class NmsApp:
         # Add device rows
         for device in self.devices:
             status = device.get("status", "")
-            # Set tag for row color
-            tag = status.lower() if status in ["Online", "Offline", "Failed"] else ""
+            # Determine proper tags for styling
+            tags = [status.lower()]
             
-            # Extract all values needed for the row
-            values = [device.get(col["id"], "N/A") for col in COLUMNS]
+            # Add blink tag if this status should blink
+            if status in STATUS_TYPES and STATUS_TYPES[status]["blink"]:
+                tags.append("blink")
             
-            # Insert into tree with proper tag
-            self.tree.insert('', tk.END, values=values, tags=(tag,))
+            # Prepare values for data columns (all except icon)
+            values = []
+            for col in COLUMNS[1:]:  # Skip icon column
+                values.append(device.get(col["id"].lower(), "N/A"))
+            
+            # Get appropriate icon based on status
+            icon = None
+            if status == "Off-On":
+                # For blinking status, start with 'on' state
+                icon = self.icons["Off-On_on"]
+            elif status == "Offline":
+                # For offline status (which now blinks), start with 'on' state
+                icon = self.icons["Offline_on"]
+            elif status in self.icons:
+                icon = self.icons[status]
+            
+            # Insert row with icon in column #0 and values in data columns
+            item_id = self.tree.insert('', tk.END, text='', image=icon, values=values, tags=tuple(tags))
         
         # Configure colors for status tags
-        self.tree.tag_configure('online', background='#e0ffe0')
-        self.tree.tag_configure('offline', background='#ffe0e0')
-        self.tree.tag_configure('failed', background='#fff0c0')
+        for status_name, props in STATUS_TYPES.items():
+            self.tree.tag_configure(status_name.lower(), background=props["color"])
         
         self.status_var.set(f"Ready. {t} devices loaded.")
         self.refresh_btn.config(state=tk.NORMAL)
