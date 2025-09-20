@@ -14,13 +14,10 @@ import os, sys, re, time
 from ipaddress import ip_address
 from typing import Dict, Any, List
 from concurrent.futures import ThreadPoolExecutor, as_completed
-
+import curses
 import requests, urllib3
 from ping3 import ping
-from pysnmp.hlapi import (
-    getCmd, SnmpEngine, CommunityData, UdpTransportTarget,
-    ContextData, ObjectType, ObjectIdentity
-)
+from pysnmp.hlapi import *
 
 urllib3.disable_warnings()
 
@@ -91,15 +88,16 @@ ICON_OFF_OFF = " "  # blink off
 # ---------------- SNMP helpers ----------------
 def snmp_get(ip, comm, oid, timeout=1, retries=1):
     try:
-        it=getCmd(SnmpEngine(), CommunityData(comm, mpModel=1),
+        it=nextCmd(SnmpEngine(), CommunityData(comm, mpModel=1),
                   UdpTransportTarget((ip,161),timeout=timeout,retries=retries),
-                  ContextData(), ObjectType(ObjectIdentity(oid)))
-        eI,eS,eX,vb=next(it)
-        if eI or eS: return None
-        for v in vb:
-            val=v[1].prettyPrint()
-            if "No Such" in val: return None
-            return val
+                  ContextData(), ObjectType(ObjectIdentity(oid)),
+                  lexicographicMode=False)
+        for eI,eS,eX,vb in it:
+            if eI or eS: return None
+            for v in vb:
+                val=v[1].prettyPrint()
+                if "No Such" in val: return None
+                return val
     except Exception: return None
 
 def detect_vendor(descr):
@@ -407,59 +405,72 @@ def read_key_nonblocking(timeout: float):
             time.sleep(timeout); return None
 
 # ---------------- Main ----------------
-def main():
-    enable_ansi_on_windows()
 
-    print(BOLD + "Aruba NMS Live Monitor (ASCII)" + RESET)
-    api_user = input("API Username: ").strip()
-    api_pass = input("API Password: ").strip()
-    snmp_comm = input("SNMP community (default: public): ").strip() or "public"
+def curses_main(stdscr):
+    curses.curs_set(0)
+    stdscr.clear()
+    stdscr.refresh()
+
+    stdscr.addstr(0, 0, "Aruba NMS Live Monitor (curses)", curses.A_BOLD)
+    stdscr.addstr(1, 0, "API Username: ")
+    stdscr.refresh()
+    curses.echo()
+    api_user = stdscr.getstr(1, 14, 32).decode().strip()
+    stdscr.addstr(2, 0, "API Password: ")
+    stdscr.refresh()
+    api_pass = stdscr.getstr(2, 14, 32).decode().strip()
+    stdscr.addstr(3, 0, "SNMP community (default: public): ")
+    stdscr.refresh()
+    snmp_comm = stdscr.getstr(3, 32, 32).decode().strip() or "public"
+    curses.noecho()
 
     try:
         ips = read_ips()
     except Exception as e:
-        print(RED + f"Failed to read {IP_FILE}: {e}" + RESET); return
+        stdscr.addstr(5, 0, f"Failed to read {IP_FILE}: {e}", curses.color_pair(1))
+        stdscr.refresh()
+        stdscr.getch()
+        return
 
-    devices: List[Dict[str,Any]] = []
-    last_refresh_text = "—"
-
-    # Draw header once (no rows yet)
-    render_header(devices, last_refresh_text)
-
-    # ---------- First pass: streaming, re-sort, repaint rows WITHOUT clearing ----------
-    blink_on = True  # keep a steady icon state during painting
-    for d in poll_streaming(ips, api_user, api_pass, snmp_comm):
-        devices.append(d)
-        devices = repaint_table_in_place(devices, blink_on)
-
-    # Mark completion time & one clean redraw (keeps UI consistent)
+    devices: List[Dict[str,Any]] = poll_all(ips, api_user, api_pass, snmp_comm)
     last_refresh_text = time.strftime("%Y-%m-%d %H:%M:%S")
-    devices = redraw_table(devices, blink_on=True, last_refresh_text=last_refresh_text)
 
-    # ---------- Continuous loop: blink + periodic refresh ----------
-    blink_on = False
-    last_refresh = time.time()
+    # Print summary
+    t,o,f,off = counts(devices)
+    summary = f"Total: {t} | Online: {o} | Failed: {f} | Offline: {off}"
+    stdscr.addstr(5, 0, summary, curses.A_BOLD)
+    stdscr.addstr(6, 0, f"Last refresh: {last_refresh_text}", curses.A_DIM)
 
-    try:
-        while True:
-            # Smooth blink: touches only icon cells
-            blink_icons(devices, blink_on); blink_on = not blink_on
+    # Print table header
+    header = "IP".ljust(W_IP) + "Status".ljust(W_STATUS) + "Vendor".ljust(W_VENDOR) + "Model".ljust(W_MODEL) + "Serial".ljust(W_SERIAL) + "CPU".rjust(W_CPU) + "Mem".rjust(W_MEM) + "Uptime".ljust(W_UPTIME)
+    stdscr.addstr(8, 0, header, curses.A_UNDERLINE)
 
-            # Non-blocking key
-            ch = read_key_nonblocking(BLINK_PERIOD_SEC)
-            if ch and ch.lower() == "q": break
+    # Print device rows safely
+    max_rows = curses.LINES - 3  # leave space for summary and exit prompt
+    max_cols = curses.COLS - 1
+    for idx, d in enumerate(devices):
+        row = 9 + idx
+        if row >= max_rows:
+            break
+        status = d.get("status", "N/A")
+        color = curses.color_pair(2) if status == "Online" else curses.color_pair(3) if status == "Failed" else curses.color_pair(4)
+        line = d["ip"].ljust(W_IP) + status.ljust(W_STATUS) + d.get("vendor", "N/A").ljust(W_VENDOR) + d.get("model", "N/A").ljust(W_MODEL) + d.get("serial", "N/A").ljust(W_SERIAL) + d.get("cpu", "N/A").rjust(W_CPU) + d.get("mem", "N/A").rjust(W_MEM) + d.get("uptime", "N/A").ljust(W_UPTIME)
+        stdscr.addstr(row, 0, line[:max_cols], color)
 
-            # Timed refresh
-            now = time.time()
-            if now - last_refresh >= REFRESH_SEC:
-                new_devices = poll_all(ips, api_user, api_pass, snmp_comm)
-                devices = redraw_table(new_devices, blink_on=blink_on,
-                                       last_refresh_text=time.strftime("%Y-%m-%d %H:%M:%S"))
-                last_refresh = now
-    finally:
-        show()
-        last_row = (max(_row_pos.values(), default=TABLE_TOP) + 2)
-        mv(last_row,1); print(RESET + "Bye.")
+    stdscr.addstr(min(row+2, curses.LINES-1), 0, "Press any key to exit.")
+    stdscr.refresh()
+    stdscr.getch()
+
+
+def setup_curses():
+    curses.initscr()
+    curses.start_color()
+    curses.init_pair(1, curses.COLOR_RED, curses.COLOR_BLACK)    # Error
+    curses.init_pair(2, curses.COLOR_GREEN, curses.COLOR_BLACK)  # Online
+    curses.init_pair(3, curses.COLOR_YELLOW, curses.COLOR_BLACK) # Failed
+    curses.init_pair(4, curses.COLOR_RED, curses.COLOR_BLACK)    # Offline
+
 
 if __name__ == "__main__":
-    main()
+    setup_curses()
+    curses.wrapper(curses_main)
