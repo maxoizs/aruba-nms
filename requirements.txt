@@ -1,0 +1,6 @@
+requests
+ping3
+pysnmp
+urllib3
+windows-curses
+pillow
