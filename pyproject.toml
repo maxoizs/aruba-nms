@@ -1,0 +1,69 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "aruba-nms"
+version = "0.1.0"
+description = "Aruba Network Monitoring System"
+readme = "README.md"
+requires-python = ">=3.7"
+license = {text = "MIT"}
+authors = [
+  { name = "Your Name", email = "your.email@example.com" },
+]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: System Administrators",
+    "Topic :: System :: Networking :: Monitoring",
+]
+dependencies = [
+    "requests",
+    "ping3",
+    "pysnmp",
+    "urllib3",
+    "pillow",
+    "windows-curses; platform_system == 'Windows'",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest",
+    "black",
+    "isort",
+    "flake8",
+]
+
+[project.urls]
+"Homepage" = "https://github.com/yourusername/aruba-nms"
+"Bug Tracker" = "https://github.com/yourusername/aruba-nms/issues"
+
+[project.scripts]
+aruba-nms-gui = "aruba_nms.nms_gui:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["aruba_nms"]
+
+[tool.hatch.build.targets.sdist]
+include = [
+    "aruba_nms",
+    "README.md",
+    "LICENSE",
+]
+
+[tool.hatch.build]
+include = [
+    "aruba_nms/data/*.txt",
+    "aruba_nms/icons/*",
+]
+
+[tool.black]
+line-length = 88
+target-version = ['py37']
+
+[tool.isort]
+profile = "black"
+line_length = 88

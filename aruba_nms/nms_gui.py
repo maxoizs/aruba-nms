@@ -21,12 +21,19 @@ import requests, urllib3
 from ping3 import ping
 from pysnmp.hlapi import *
 
+# When running as a package, we need to handle file paths differently
+import pkg_resources
+import pathlib
+
 urllib3.disable_warnings()
 
 # ---------------- Configuration ----------------
 REFRESH_SEC = 60.0
 MAX_WORKERS = 20
+# Look for IP_FILE in the current directory first, then fall back to package data
 IP_FILE = "ip.txt"
+if not os.path.exists(IP_FILE):
+    IP_FILE = str(pathlib.Path(pkg_resources.resource_filename('aruba_nms', 'data/ip.txt')))
 
 # Column definitions
 COLUMNS = [
@@ -908,14 +915,26 @@ class SettingsDialog:
         self.dialog.destroy()
 
 
-if __name__ == "__main__":
+def main():
     # Create sample IP file if it doesn't exist
     if not os.path.exists(IP_FILE):
-        with open(IP_FILE, "w") as f:
-            f.write("192.168.1.1\n")
-            f.write("192.168.1.2\n")
-            f.write("10.0.0.1\n")
+        # Try to create the data directory if it's a package installation
+        try:
+            data_dir = os.path.dirname(IP_FILE)
+            if not os.path.exists(data_dir):
+                os.makedirs(data_dir, exist_ok=True)
+                
+            with open(IP_FILE, "w") as f:
+                f.write("192.168.1.1\n")
+                f.write("192.168.1.2\n")
+                f.write("10.0.0.1\n")
+        except Exception as e:
+            print(f"Warning: Could not create sample IP file: {e}")
         
     root = tk.Tk()
     app = NmsApp(root)
     root.mainloop()
+
+
+if __name__ == "__main__":
+    main()
