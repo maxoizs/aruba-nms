@@ -40,3 +40,4 @@ htmlcov/
 .DS_Store
 # Windows
 Thumbs.db
+aruba_nms/nms_settings.json
